@@ -1,0 +1,324 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mx:Application
+  xmlns:mx="http://www.adobe.com/2006/mxml"
+  backgroundColor="#000000"
+  creationComplete="creationCompleteHandler(event)"
+  layout='absolute'
+>
+  <mx:Script>
+    <![CDATA[
+    import flash.net.*;
+    import flash.display.Loader;
+    import flash.geom.Matrix;
+    import mx.events.*;
+    import mx.utils.URLUtil;
+    import mx.core.UIComponent;
+    import mx.controls.Alert;
+    import mx.binding.utils.BindingUtils;
+    import com.adobe.images.JPGEncoder;
+    import com.adobe.serialization.json.*;
+
+    // Set some constants for our multipart POST request
+    private const POST_NEWLINE:String           = '\r\n';
+    private const POST_BOUNDARY:String          = "----xxThumbnailerBoundaryxx";
+    private const POST_PREFIXED_BOUNDARY:String = "--"+POST_BOUNDARY;
+
+    [Bindable]
+    public var debugLabel:String = 'none';
+
+    private var thumbnailBitmap:BitmapData;
+
+    // Flashvars
+    [Bindable]
+    private var _videoFile:String;
+    private var _postURL:String;
+    private var _postData:String;
+    private var _thumbDataPostVar:String;
+    private var _onCompleteCallback:String;
+    private var _onBeginCallback:String;
+    private var _autoThumbnailFirstFrame:Boolean;
+
+    private function creationCompleteHandler(event:Event):void
+    {
+      registerExternalInterface();
+      processFlashvars();
+      processSecurity();
+      initializeVideo();
+      initializeScrubber();
+    }
+
+    private function registerExternalInterface():void
+    {
+      ExternalInterface.addCallback('enableSnapshot', function():void
+      {
+        snapshotButton.visible = true;
+      });
+
+      ExternalInterface.addCallback('disableSnapshot', function():void
+      {
+        snapshotButton.visible = false;
+      });
+    }
+
+    private function processFlashvars():void
+    {
+      // Shortcut
+      var flashVars:Object = Application.application.parameters;
+
+      _videoFile = flashVars.videoFile;
+      _postURL   = flashVars.postURL;
+      _postData  = flashVars.postData;
+      _thumbDataPostVar        = flashVars.thumbDataPostVar;
+      _onBeginCallback         = flashVars.onBeginCallback;
+      _onCompleteCallback      = flashVars.onCompleteCallback;
+      _autoThumbnailFirstFrame = flashVars.autoThumbnailFirstFrame &&
+                                 flashVars.autoThumbnailFirstFrame != 'false';
+    }
+
+    private function processSecurity():void
+    {
+      // Check and see if this is an external URL
+      if(URLUtil.getServerName(_videoFile))
+      {
+        // Parse the protocol, hostname and port 
+        var videoSecurityPath:String = URLUtil.getProtocol(_videoFile) + '://' +
+                                       URLUtil.getServerNameWithPort(_videoFile) +
+                                       '/crossdomain.xml';
+
+        // Tell flash to look for the policy file on this resource
+        Security.loadPolicyFile(videoSecurityPath);
+      }
+    }
+
+    private function initializeVideo():void
+    {
+      videoDisplay.addEventListener(VideoEvent.STATE_CHANGE, function(ve:VideoEvent):void
+      {
+        debugLabel = 'video state: '+ve.state;
+        if(ve.state == VideoEvent.PLAYING || ve.state == VideoEvent.BUFFERING || ve.state == VideoEvent.LOADING)
+        {
+          hideAndShow(playButton, pauseButton);
+        } else { // if(ve.state == VideoEvent.PAUSED || ve.state == VideoEvent.STOPPED) {
+          hideAndShow(pauseButton, playButton);
+        }
+      });
+    }
+
+    private function initializeScrubber():void
+    {
+      scrubber.addEventListener(SliderEvent.THUMB_PRESS, function(se:SliderEvent):void
+      {
+        videoDisplay.pause();
+      });
+
+      scrubber.addEventListener(SliderEvent.CHANGE, function(se:SliderEvent):void
+      {
+        debugLabel = 'scrubber value: ' + se.value;
+        //videoDisplay.playheadTime = se.value;
+      });
+    }
+
+    public function videoMetadataHandler():void
+    {
+      // We know the video's width/height now
+      // Now we want to prep our thumbnail to be
+      // - same size as video if video is smaller than viewport
+      // - fit-to-box into the viewport if it is larger
+
+      var thumbnailWidth:Number;
+      var thumbnailHeight:Number;
+
+      // Fit-to-box always (does cause stretch or shrink to video):
+      var videoWHRatio:Number    = videoDisplay.videoWidth / videoDisplay.videoHeight;
+      var viewportWHRatio:Number = videoDisplay.width      / videoDisplay.height;
+      var scaleRatio:Number; // This is what we're going to set
+      // Shrink to video's width
+      if(videoWHRatio > viewportWHRatio)
+      {
+        scaleRatio = videoDisplay.width / videoDisplay.videoWidth;
+      }
+      // Shrink to video's height
+      else
+      {
+        scaleRatio = videoDisplay.height / videoDisplay.videoHeight;
+      }
+
+      // Now use the ratio we set
+      thumbnailWidth  = videoDisplay.videoWidth*scaleRatio;
+      thumbnailHeight = videoDisplay.videoHeight*scaleRatio;
+
+      // Set up the Bitmap to extract the video to and the jpg from
+      thumbnailBitmap = new BitmapData(thumbnailWidth, thumbnailHeight, false, 0x000000);
+      // Call out to Javascript and let it know the video's dimensions
+      ExternalInterface.call("setVideoDimensions", videoDisplay.videoWidth, videoDisplay.videoHeight);
+
+      // If we are expected to autograb the first frame, do so now
+      if(_autoThumbnailFirstFrame)
+      {
+        videoDisplay.addEventListener(VideoEvent.PLAYHEAD_UPDATE, snapFirstFrame)
+      }
+    }
+
+    private function snapFirstFrame(ve:VideoEvent):void
+    {
+      if(ve.playheadTime > 0.5)
+      {
+        processJPG();
+        videoDisplay.removeEventListener(VideoEvent.PLAYHEAD_UPDATE, snapFirstFrame);
+      }
+    }
+
+    private function processJPG():void
+    {
+      if(!thumbnailBitmap)
+      {
+        Alert.show("Video not loaded yet!");
+        return;
+      }
+      // Spinner, message, some indication that the server is being hit
+      ExternalInterface.call(_onBeginCallback);
+
+      // Create the request object
+      var thumbnailPostRequest:URLRequest = new URLRequest(_postURL);
+      thumbnailPostRequest.method = URLRequestMethod.POST;
+
+      try {
+        //
+        thumbnailPostRequest.requestHeaders.push(new URLRequestHeader("Content-type","multipart/form-data; boundary="+POST_BOUNDARY));
+
+        // Set up the request, do some error handling
+        var thumbnailLoader:URLLoader = new URLLoader();
+        // On completion:
+        // thumbnailLoader.addEventListener(Event.COMPLETE, function(e:Event):void {});
+
+        // Start the form data string
+        var formString:String = '';
+
+        // Add all of the injected POST vars
+        var jsonObject:Object = JSON.decode(_postData);
+        for(var postKey:String in jsonObject)
+        {
+          formString += POST_PREFIXED_BOUNDARY + POST_NEWLINE;
+          formString += 'Content-Disposition: form-data; name="'+postKey+'"'+POST_NEWLINE;
+          formString += POST_NEWLINE;
+          formString += jsonObject[postKey] + POST_NEWLINE;
+        }
+
+        // Identity Matrix values
+        var translateX:Number  = 0,
+            translateY:Number  = 0;
+
+        // Translate the video to the origin to remove letterboxing
+        translateX = (thumbnailBitmap.width  - videoDisplay.width)/2;
+        translateY = (thumbnailBitmap.height - videoDisplay.height)/2;
+
+        // Define the Matrix that does the calculated operations
+        var videoDisplayTransform:Matrix = new Matrix(1, 0, 0, 1, translateX, translateY);
+        // Write the video pixels to a Bitmap object  (scaled and translated appropriately)
+        thumbnailBitmap.draw(videoDisplay, videoDisplayTransform);
+        // Extract the pixels into a JPG encoder
+        var encoder:JPGEncoder = new JPGEncoder(90);
+        // Encode the JPG as a ByteArray
+        var jpgData:ByteArray  = encoder.encode(thumbnailBitmap);
+
+        // Write the JPG data into the POST request as an octet-stream
+        formString += POST_PREFIXED_BOUNDARY + POST_NEWLINE;
+        formString += 'Content-Disposition: form-data; name="'+_thumbDataPostVar + '"; filename="thumbnail.jpg"' + POST_NEWLINE;
+        formString += 'Content-Type: application/octet-stream' + POST_NEWLINE;
+        formString += POST_NEWLINE;
+        // jpgData is already a ByteArray so i'll write it manually
+        // formString += jpgData + POST_NEWLINE;
+        // formString += POST_PREFIXED_BOUNDARY; //... + '--' // Is this needed?
+
+        // Convert the POST data string into a ByteArray
+        var formDataArray:ByteArray = new ByteArray();
+        formDataArray.writeMultiByte(formString, "ascii");
+        formDataArray.writeBytes(jpgData);
+        formDataArray.writeMultiByte(POST_NEWLINE + POST_PREFIXED_BOUNDARY, "ascii");
+        // Set the POST vars
+        thumbnailPostRequest.data = formDataArray;
+
+        // Fire off the POST request
+        thumbnailLoader.load(thumbnailPostRequest);
+
+        // If an error didn't break us out by now, call the onComplete callback
+        if(_onCompleteCallback)
+        {
+          thumbnailLoader.addEventListener(Event.COMPLETE, function(e:Event):void
+          {
+            ExternalInterface.call(_onCompleteCallback);
+          });
+        }
+      } catch(se:SecurityError) {
+        trace(se.message);
+      } catch(e:Error) {
+        trace(e.message);
+      }
+    }
+
+    private function hideAndShow(hideComponent:UIComponent, showComponent:UIComponent):void
+    {
+      hideComponent.visible = hideComponent.includeInLayout = false;
+      showComponent.visible = showComponent.includeInLayout = true;
+    }
+    ]]>
+  </mx:Script>
+
+  <mx:VBox
+    width="100%"
+    height="100%"
+  >
+    <mx:VideoDisplay
+      id='videoDisplay'
+      width='400'
+      height='300'
+      source="{_videoFile}"
+      playheadTime="{scrubber.value}"
+      metadataReceived="videoMetadataHandler()"
+    />
+
+    <mx:HBox
+      horizontalGap='2'
+      horizontalCenter='0'
+    >
+      <!-- Pause/Play button -->
+      <mx:Canvas
+        width='70'
+      >
+        <mx:Button
+          id='playButton'
+          label="Play"
+          visible='false'
+          includeInLayout='false'
+          click="videoDisplay.play()"
+        />
+        <mx:Button
+          id='pauseButton'
+          label='Pause'
+          click="videoDisplay.pause()"
+        />
+      </mx:Canvas>
+      <!-- Scrubber canvas -->
+      <mx:HSlider
+        id='scrubber'
+        maximum="{videoDisplay.totalTime}"
+        minimum='0'
+        value="{videoDisplay.playheadTime}"
+        scaleX='1.15'
+        scaleY='1.15'
+      />
+      <!-- Snapshot Button -->
+      <mx:Button
+        id='snapshotButton'
+        label='Save as Thumbnail'
+        click='processJPG()'
+      />
+    </mx:HBox>
+    <!--mx:Label
+      text="{'Debug: '+debugLabel}"
+    /-->
+  </mx:VBox>
+
+  <!-- Import StyleSheet -->
+  <mx:Style source="video_thumbnailerSkin.css" />
+</mx:Application>

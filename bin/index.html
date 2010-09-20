@@ -1,0 +1,83 @@
+<html>
+<head>
+  <script src='swfobject.js'></script>
+  <script src='prototype.js'></script>
+  <script>
+
+  var Thumbnailer =
+  { currentURL: ''
+  , setURL: function(newURL)
+    {
+      this.cleanup();
+      this.currentURL = newURL;
+      this.addMovie();
+    }
+  , cleanup: function()
+    {
+      // Remove the movie element, if it exists
+      $('thumbnailerContainer').update('<div id="thumbnailerHanger"/>');
+    }
+  , addMovie: function()
+    {
+      // Do the SWFObject dance with the URL in the appropriate place
+      var flashvars =
+      { 'file'    : this.currentURL  // URL of the movie to load
+      , 'postURL' : 'path/to/thumbnail/post.php'     // Place to post the snapshot
+      , 'postData': '{"var1":1,"varABC":"abc"}'
+      , 'thumbDataPostVar': 'videoThumbnail'
+      };
+      var params = { };
+      var attributes = { id: 'thumbnailer' };
+
+      var swfEmbedCallback = function(e) {
+          if(!e.success)
+          {
+              $('thumbnailerContainer').update('<div class="noFlash">Flash is required to set up a video media type.<blockquote><a href="http://www.adobe.com/go/getflashplayer">Install Flash Player<br /><img src="http://www.adobe.com/images/shared/download_buttons/get_flash_player.gif" alt="Get Adobe Flash player" /></a></blockquote></div>');
+          }
+      };
+      var swfLocation = 'video_thumbnailer.swf'; // '/www/thumbnailer/player.swf'
+
+      swfobject.embedSWF(swfLocation, 'thumbnailerHanger', 400, 300,
+                         '9.0.28', "/www/swfobject/expressInstall.swf",
+                         flashvars, params, attributes, swfEmbedCallback);
+  } };
+
+  document.observe('dom:loaded', function()
+  {
+    $('url').observe('blur', function(event)
+    {
+      // Extract the URL entered into the form and give it to the Thumbnailer
+      Thumbnailer.setURL($F(this));
+    });
+  });
+
+  var setVideoDimensions = function(setWidth, setHeight)
+  {
+    $('videoWidth').update(setWidth);
+    $('videoHeight').update(setHeight);
+  }
+
+  </script>
+</head>
+
+<body>
+  <h2>Video</h2>
+  <div class="form-container">
+
+    <fieldset>
+    <legend>Video Detail</legend>
+      <div>
+        <p>Width: <span id='videoWidth'>0</span></p>
+        <p>Height: <span id='videoHeight'>0</span></p>
+      </div>
+      <div>
+          <label for="url">URL:</label>
+          <input id='url' type='textfield'/>
+      </div>
+      <div id='thumbnailerContainer'>
+        <div id='thumbnailerHanger'></div>
+      </div>
+    </fieldset>
+  </div>
+</body>
+</html>
